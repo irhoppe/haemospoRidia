@@ -279,8 +279,34 @@ summary {
 </ol>
 </div>
 </div>
-<div id="workflow-1" class="section level1" number="2">
-<h1><span class="header-section-number">2</span> WORKFLOW</h1>
+<div id="function-tree" class="section level1" number="2">
+<h1><span class="header-section-number">2</span> FUNCTION TREE</h1>
+<p>Here I identify the functions performing most of the major steps in the workflow outlined above (steps A–C). These are defined in the <code>functionR</code> chunk of the <code>sequence-analysis</code> document, but I’ve layed them out here in a way that I hope makes their utility and organization a bit more intuitive. The nesting in this list gives an indication of the calling structure, e.g. <code>read_abif()</code> calls <code>read.abif()</code> to perform the initial data import, then <code>trim_abif()</code> to identify trim locations, etc.</p>
+<ol style="list-style-type: upper-alpha">
+<li><code>read_abif()</code>
+<ol style="list-style-type: decimal">
+<li><code>sangerseqR::read.abif()</code> imports reads</li>
+<li><code>trim_abif()</code> identifies and reconciles trim locations, performs basecalling, and appends basecalled sequences as new elements in abif read object
+<ol style="list-style-type: lower-alpha">
+<li><code>trim_primer()</code> 3’/end of read trim</li>
+<li><code>trim_mott()</code> quality trim
+<ol style="list-style-type: lower-roman">
+<li><code>fix_trims()</code> reconciles quality trim with <code>sangerseqR::makeBaseCalls()</code> base-dropping</li>
+</ol></li>
+<li><code>sangerseqR::makeBaseCalls()</code> output for primary and secondary basecalled sequences is trimmed according to locations identified above, then saved to the abif read object</li>
+</ol></li>
+<li><code>secondary_peaks()</code> identifies any secondary peaks within the trimmed sequence and appends their locations as a new element in the abif read object</li>
+</ol></li>
+<li><code>get_consensus()</code> matches forward and reverse reads by sample, performs MSA, then determines consensus sequence (called separately for primary and secondary sequences)
+<ol style="list-style-type: decimal">
+<li><code>align_seqs()</code>
+<ol style="list-style-type: lower-alpha">
+<li><code>msa::msa(method=&quot;Muscle&quot;)</code> first choice; if this fails (e.g., if only one sequence is available), resorts to <code>DECIPHER::AlignSeqs()</code></li>
+<li><code>DECIPHER::StaggerAlignment()</code></li>
+</ol></li>
+<li><code>DECIPHER::ConsensusSequence()</code></li>
+</ol></li>
+</ol>
 </div>
 <div class="footnotes">
 <hr />

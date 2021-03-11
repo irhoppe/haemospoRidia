@@ -877,6 +877,9 @@ cons_2_seqs <- get_consensus(reads, secondary=TRUE)             # get secondary 
 
 ```{r}
 
+## This chunk is an attempt to trim the consensus reads to the 479-bp target region. However, given the variability in read quality and length (some are already <<479 bp after quality trimming), I don't feel that it's doing well.
+## At present, this code hasn't been fully integrated into the analysis, and represents more of a test.
+
 seq <- "primary"
 haem_primers <- DNAStringSet(primers_target)
 haem_primers[2] <- reverseComplement(haem_primers[2])

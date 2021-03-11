@@ -68,6 +68,20 @@ F) COMPILE BLAST RESULTS
     2. Write results to two separate files, one for primary consensus sequence hits and another for secondary consensus sequence hits
     3. There is a many-to-one relation between GenBank accession numbers and parasite lineages—each lineage could correspond to many NCBI sequences (although there is usually one accession number corresponding to the initial reference source for the lineage).
 
-# WORKFLOW
+# FUNCTION TREE
 
+Here I identify the functions performing most of the major steps in the workflow outlined above (steps A–C). These are defined in the `functionR` chunk of the `sequence-analysis` document, but I've layed them out here in a way that I hope makes their utility and organization a bit more intuitive. The nesting in this list gives an indication of the calling structure, e.g. `read_abif()` calls `read.abif()` to perform the initial data import, then `trim_abif()` to identify trim locations, etc.
 
+  A) `read_abif()`
+      1. `sangerseqR::read.abif()` imports reads
+      2. `trim_abif()` identifies and reconciles trim locations, performs basecalling, and appends basecalled sequences as new elements in abif read object
+          (a) `trim_primer()` 3'/end of read trim
+          (b) `trim_mott()` quality trim
+               i) `fix_trims()` reconciles quality trim with `sangerseqR::makeBaseCalls()` base-dropping
+          (c) `sangerseqR::makeBaseCalls()` output for primary and secondary basecalled sequences is trimmed according to locations identified above, then saved to the abif read object
+      3. `secondary_peaks()` identifies any secondary peaks within the trimmed sequence and appends their locations as a new element in the abif read object
+  B) `get_consensus()` matches forward and reverse reads by sample, performs MSA, then determines consensus sequence (called separately for primary and secondary sequences)
+      1. `align_seqs()`
+          (a) `msa::msa(method="Muscle")` first choice; if this fails (e.g., if only one sequence is available), resorts to `DECIPHER::AlignSeqs()`
+          (b) `DECIPHER::StaggerAlignment()`
+      2. `DECIPHER::ConsensusSequence()`
