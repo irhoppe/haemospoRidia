@@ -1,0 +1,1192 @@
+---
+title: "SequenceR"
+author: "Ian Hoppe"
+date: "`r format( Sys.Date(), '%d %B %Y' )`"
+output: 
+  bookdown::html_document2:
+    theme: lumen
+    highlight: tango
+---
+
+```{r initializR, include=FALSE}
+
+knitr::opts_chunk$set( echo=FALSE, 
+                       message=FALSE, 
+                       warning=FALSE )
+
+```
+
+```{r pkgR}
+
+## load requisite packages for extended functionality
+
+library( plyr )       # für data munging
+library( dplyr )
+library( tidyr )
+library( Biostrings ) # für sequence munging
+library( sangerseqR )
+library( msa )
+
+```
+
+```{r functionR}
+
+get_sn_ratio <- function( abif, prefix="SNq", sep="_" ){
+  # Extract signal:noise ratio (as a rough quality estimate) from an ABI-formatted sequencing read
+  snratio <- data.frame(t(abif@data$`S/N%`))
+  names(snratio) <- paste( prefix, c("G", "A", "T", "C"), sep=sep )
+  return(snratio)
+}
+
+read_abif <- function( file, primer, target_primers ){
+  # wrapper for importing ABI-formatted files and performing preliminary analyses and trimming functions
+  abif <- read.abif(file)          # perform initial import
+  abif <- trim_abif(abif, primer, target_primers)  # compute trim locations; store loci and basecalled sequences as new elements in abif@data list
+  abif <- secondary_peaks(abif)    # identify secondary peak locations; store identified locations as new element in abif@data list
+  return(abif)
+}
+
+trim_abif <- function( abif, primer, target_primers=NULL, ratio=0.33 ){
+  # wrapper for performing trim functions on ABI formatted objects
+  # identifies 3' primer trim locations, Mott quality trim positions, and makeBaseCalls() trim locations
+  # reconciles all trim locations, makes primary and secondary basecalls, and stores sequences as new elements in updated ABIF list object
+  
+  primer_trim <- trim_primer(abif, primer)                                 # find the end of the template
+  trims <- trim_mott(abif, fix=TRUE)                                       # get quality trim locations using the modified Mott algorithm; fix based on sangerseqR auto-trimming
+  
+  if(!is.null(target_primers)){
+    target_trim <- trim_to_target(abif, target_primers)
+    trims["start"] <- max(c(trims["start"],target_trim["start"]))
+    trims["end"] <- min(c(trims["end"],target_trim["end"],primer_trim))
+  } else {
+    trims["end"] <- min(c(trims["end"],primer_trim))
+  }
+  
+  basecalls <- makeBaseCalls(sangerseq(abif), ratio=ratio)                 # perform sangerseqR basecalling on the corresponding sangerseq object
+  primary_seq <- primarySeq(basecalls, string=TRUE)
+  secondary_seq <- secondarySeq(basecalls, string=TRUE)
+  
+  primary_seq <- substring(primary_seq, trims["start"], trims["end"])      # trim the basecalled sequences
+  secondary_seq <- substring(secondary_seq, trims["start"], trims["end"])
+  
+  abif@data$seq$primary <- primary_seq                                     # store basecalled sequences as data within the ABIF object
+  abif@data$seq$secondary <- secondary_seq
+  
+  attr(abif, "trims") <- trims                                             # save trim locations as an attribute of the ABIF object
+  
+  return(abif)
+  
+}
+
+trim_mott <- function( abif, cutoff=0.0001, fix=TRUE ){
+  # identify quality trim positions using modified Mott algorithm (http://www.phrap.org/phredphrap/phred.html, https://assets.geneious.com/manual/11.1/GeneiousManualsu84.html)
+  # based on function by Rob Lanfear (https://github.com/mammerlin/sangeranalyseR/blob/master/R/trim.mott.R)
+  # optionally fix trim positions to match base dropping by sangerseqR::makeBaseCalls()
+  
+  if(class(cutoff)!='numeric' | cutoff < 0) stop("cutoff must be a number of at least 0")
+  if(class(abif)!='abif') stop("abif must be an 'abif' object from the sangerseqR package")
+  
+  abif.data <- abif@data                         # extract ABI data from read object
+  start <- FALSE                                 # flag for starting position of trimmed sequence
+  trim_start <- 0                                # initialize start index
+  
+  seqlen <- nchar(abif.data$PBAS.2)              # compute length of raw sequence
+  QV <- abif.data$PCON.2                         # extract quality values for raw sequence data
+  Pe <- 10^(-QV/10.0)                            # for each base, compute the probability that the basecall is an error
+  
+  base_scores <- cutoff - Pe                     # calculate base scores
+  
+  # calculate running sum of base scores score 
+  # if the running sum falls < 0, set it to 0 
+  # the BioPython implementation always trims the first base, 
+  # this implementation does not. 
+  score <- base_scores[1]
+  if(score < 0){
+    score <- 0 
+  }else{
+    trim_start <- 1
+    start <- TRUE
+  }
+  
+  cumul_score <- c(score)
+  
+  for(i in 2:length(base_scores)){
+    score <- cumul_score[length(cumul_score)] + base_scores[i]
+    if(score <= 0){
+      cumul_score <- c(cumul_score, 0)
+    }else{
+      cumul_score <- c(cumul_score, score)
+      if(start == FALSE){
+        # trim_start = value when cumulative score is first > 0 
+        trim_start <- i
+        start <- TRUE
+      }
+    }
+  }
+    
+  # trim_finish = index of highest cumulative score, 
+  # marking the end of sequence segment with highest cumulative score 
+  trim_finish <- which.max(cumul_score)
+  
+  # fix an edge case, where all scores are worse than the cutoff
+  # in this case you wouldn't want to keep any bases at all
+  if(sum(cumul_score)==0){trim_finish <- 0}
+  
+  mott_trims <- c(start=trim_start, end=trim_finish)
+  
+  if(fix) mott_trims <- fix_trims(abif, mott_trims)
+  
+  return(mott_trims)
+
+}
+
+trim_primer <- function( abif, primer ){
+  # trim_primer() finds and returns the amount to trim from the 3' end of an ABIF read based on alignment with the opposing primer
+  # the function assumes that the primer is given in its own 5'->3' orientation, so begins by finding the reverse complement
+  
+  primer <- reverseComplement(DNAString(primer))                                         # get the reverse complement of the primer
+  target_seq <- DNAString(abif@data$PBAS.2)                                              # extract target sequence from ABIF object
+  seqs <- DNAStringSet(list(primer, target_seq))                                         # compile sequences to align
+
+  seq_alignment <- DECIPHER::AlignSeqs(seqs, iterations=0, refinements=0, verbose=FALSE) # perform sequence alignment
+  primer_site <- stringr::str_locate(seq_alignment[[1]], "[^-]")                         # find where the primer begins in the alignment
+  template_end <- primer_site[1]-1                                                       # template ends just before primer site
+  
+  return(template_end)
+  
+}
+
+trim_to_target <- function( abif, primers ){
+  # trim_primer() finds and returns the amount to trim from the 3' end of an ABIF read based on alignment with the opposing primer
+  # the function assumes that the primer is given in its own 5'->3' orientation, so begins by finding the reverse complement
+  
+  primer_upstream <- DNAString(primers[1])
+  primer_downstream <- reverseComplement(DNAString(primers[2]))                          # get the reverse complement of the primer
+  target_seq <- DNAString(abif@data$PBAS.2)                                              # extract target sequence from ABIF object
+  seqs <- DNAStringSet(list(primer_upstream, target_seq, primer_downstream))             # compile sequences to align
+  seq_alignment <- DECIPHER::AlignSeqs(seqs, iterations=0, refinements=0, verbose=FALSE) # perform sequence alignment
+  
+  alignment_length <- nchar(seq_alignment[1])                                            # total length of alignment
+  upstream_primer_site <- alignment_length-(stringr::str_locate(reverse(seq_alignment[[1]]), "[^-]")[1]-2)  # find where upstream primer ends in the alignment
+  template_adjustment <- stringr::str_locate(seq_alignment[[2]], "[^-]")[1]-1            # allowance for 5' expansion of target sequence from upstream primer
+  downstream_primer_site <- stringr::str_locate(seq_alignment[[3]], "[^-]")[1]-1         # find where the downstream primer begins in the alignment
+  
+  template_range <- c(start=upstream_primer_site, end=downstream_primer_site)-template_adjustment
+  
+  if(diff(template_range)<450){     # if the resulting template isn't approximately the expected length (479bp), assume the read is too short or of poor quality; 
+    template_range[1] <- -Inf
+    template_range[2] <- Inf
+  }
+  
+  return(template_range)
+  
+}
+
+fix_trims <- function( abif, mott_trims ){
+  # reconcile quality trim positions identified by trim_mott() with basedropping by sangerseqR::makeBaseCalls()
+  # based on function by Rob Lanfear (https://github.com/mammerlin/sangeranalyseR/blob/master/R/trim.mott.R)
+  
+  seq.sanger <- sangerseq(abif)
+  
+  # transfer trim locations from one sequence (denoted in the trims list, and which 
+  # correspond to the seq.abif object to another 
+  # the primarySeq(seq.sanger) from the seq.sanger object
+  
+  if(mott_trims["start"] == 0 & mott_trims["end"] == 0){
+    # no need to do anything fancy here...
+    return(mott_trims)
+  }
+  
+  # 1. First we trim the original sequence
+  original_trimmed <- substring(abif@data$PBAS.2, mott_trims["start"], mott_trims["end"])
+  
+  # 2. Align the original and recalled sequences
+  recalled <- primarySeq(seq.sanger, string=TRUE)
+  seqs <- DNAStringSet(c(original_trimmed, recalled))
+  pa <- DECIPHER::AlignSeqs(seqs, iterations=0, refinements=0, verbose=FALSE)
+  
+  # 3. Get the sequence out, and find the first and last gaps.
+  seq_alignment <- as.character(pa[[1]])
+  not_gaps <- stringr::str_locate_all(seq_alignment, pattern="[^-]")[[1]][,1]
+  
+  trim_start <- min(not_gaps)
+  trim_end <- max(not_gaps)
+  
+  if(trim_start < 1){trim_start <- 1}
+  if(trim_end > nchar(recalled)){trim_end <- nchar(recalled)}
+  
+  mott_trims <- c(start=trim_start, end=trim_end)
+  
+  return(mott_trims)
+}
+
+secondary_peaks <- function( abif, ratio=0.33 ){
+  
+  basecalls <- makeBaseCalls(sangerseq(abif), ratio=ratio)                   # extract untrimmed basecalled sequences from ABIF object
+  primary_seq <- unlist(strsplit(primarySeq(basecalls, string=TRUE),""))     # 
+  secondary_seq <- unlist(strsplit(secondarySeq(basecalls, string=TRUE),"")) # 
+  
+  comp_seq <- compareStrings(primary_seq, secondary_seq)                     # locate differences between basecalled sequences
+  diffs <- grep(pattern ='\\?',comp_seq) # 
+
+  peaks_df <- data.frame( position=diffs,                                    # summarize secondary peak data
+                          primary_basecall=primary_seq[diffs], 
+                          secondary_basecall=secondary_seq[diffs] )
+  
+  n_sec_peaks <- c( n=nrow(peaks_df) )                                       # count the total number of secondary peaks in the untrimmed basecalled sequences
+  
+  if(!is.null(trims <- attr(abif,"trims") )){                                # perform additional calculations if ABIF has been trimmed
+    peaks_df$trimmed <- with( peaks_df, as.integer(position<trims["start"] | position>trims["end"]) ) # identify which peaks remain in the trimmed sequence
+    offset <- max(0,trims["start"]-1)                                        # compute a positional offset
+    peaks_df$position_trimmed <- with( peaks_df, position-offset )           # 
+    n_sec_peaks["untrimmed"] <- sum(!peaks_df$trimmed)                       # count the number of secondary peaks remaining in the trimmed sequence
+  }
+  
+  abif@data$secondary_peaks <- peaks_df                                      # store secondary peak summary as data within ABIF object
+  
+  attr(abif, "secondary_peaks") <- n_sec_peaks                               # save secondary peak count(s) as an attribute of the ABIF object
+  
+  return(abif)
+  
+}
+
+chromatogram_2arypeaks <- function( abif, ratio=0.33, dir, prefix, showtrim=FALSE, title=NULL){
+  
+  s <- sangerseq(abif)
+  
+  basecalls <- makeBaseCalls(s, ratio = ratio)
+  
+  trims <- attr(abif, "mott_trim")
+  if(is.null(trims)){
+    abif <- trim_mott(abif, fix=TRUE)
+    trims <- attr(abif, "mott_trim")
+  }
+  
+  seqlen <- nchar(basecalls@primarySeq)
+  t5 <- max(0,trims["start"]-1)
+  t3 <- seqlen-trims["finish"]
+  
+  if(dir.exists(dir)){
+    chromname <- paste(prefix, "_", "chromatogram.pdf", sep="")
+    chrom <- chromatogram.basepos(basecalls, trim5=t5, trim3=t3, height=3, showcalls="both", filename=file.path(dir, chromname), width=50, showtrim=showtrim, title=title)
+  }else{
+    warning(sprintf("Couldn't find directory '%s', no files saved", output.folder))
+  }
+
+}
+
+# A modified version of sangerseqR::chromatogram() to include the base positions on the x axis;
+# called from chromatogram_2arypeaks()
+chromatogram.basepos <- function(obj, trim5=0, trim3=0, showcalls=c("primary", "secondary", "both", "none"), 
+                                 width=100, height=2, cex.mtext=1, cex.base=1, ylim=3, filename=NULL, 
+                                 showtrim=FALSE, showhets=TRUE, title=NULL) {
+  
+  originalpar <- par(no.readonly = TRUE)
+  showcalls <- showcalls[1]
+  traces <- obj@traceMatrix
+  basecalls1 <- unlist(strsplit(toString(obj@primarySeq), ""))
+  basecalls2 <- unlist(strsplit(toString(obj@secondarySeq), 
+                                ""))
+  aveposition <- rowMeans(obj@peakPosMatrix, na.rm = TRUE)
+  basecalls1 <- basecalls1[1:length(aveposition)]
+  basecalls2 <- basecalls2[1:length(aveposition)]
+  if (showtrim == FALSE) {
+    if (trim5 + trim3 > length(basecalls1)) 
+      basecalls1 <- ""
+    else basecalls1 <- basecalls1[(1 + trim5):(length(basecalls1) - 
+                                                 trim3)]
+    if (trim5 + trim3 > length(basecalls2)) 
+      basecalls2 <- ""
+    else basecalls2 <- basecalls2[(1 + trim5):(length(basecalls2) - 
+                                                 trim3)]
+    aveposition <- aveposition[(1 + trim5):(length(aveposition) - 
+                                              trim3)]
+  }
+  indexes <- 1:length(basecalls1)
+  trimmed <- indexes <= trim5 | indexes > (length(basecalls1) - 
+                                             trim3)
+  if (!is.null(trim3)) {
+    traces <- traces[1:(min(max(aveposition, na.rm = TRUE) + 
+                              10, nrow(traces))), ]
+  }
+  if (!is.null(trim5)) {
+    offset <- max(c(1, aveposition[1] - 10))
+    traces <- traces[offset:nrow(traces), ]
+    aveposition <- aveposition - (offset - 1)
+  }
+  maxsignal <- apply(traces, 1, max)
+  ylims <- c(0, quantile(maxsignal, 0.75) + ylim * IQR(maxsignal))
+  p <- c(0, aveposition, nrow(traces))
+  midp <- diff(p)/2
+  starts <- aveposition - midp[1:(length(midp) - 1)]
+  starthets <- starts
+  starthets[basecalls1 == basecalls2] <- NA
+  ends <- aveposition + midp[2:(length(midp))]
+  endhets <- ends
+  endhets[basecalls1 == basecalls2] <- NA
+  starttrims <- starts
+  starttrims[!trimmed] <- NA
+  endtrims <- ends
+  endtrims[!trimmed] <- NA
+  colortranslate <- c(A = "green", C = "blue", 
+                      G = "black", T = "red")
+  colorvector1 <- unname(colortranslate[basecalls1])
+  colorvector1[is.na(colorvector1)] <- "purple"
+  colorvector2 <- unname(colortranslate[basecalls2])
+  colorvector2[is.na(colorvector2)] <- "purple"
+  valuesperbase <- nrow(traces)/length(basecalls1)
+  tracewidth <- width * valuesperbase
+  breaks <- seq(1, nrow(traces), by = tracewidth)
+  numplots <- length(breaks)
+  if (!is.null(filename)) 
+    pdf(filename, width = 8.5, height = height * numplots)
+  par(mar = c(2, 2, 4, 1), mfrow = c(numplots, 1), oma=c(0,0,2,0))
+  basecallwarning1 = 0
+  basecallwarning2 = 0
+  j = 1
+  for (i in breaks) {
+    range <- aveposition >= i & aveposition < (i + tracewidth)
+    starthet <- starthets[range] - tracewidth * (j - 1)
+    starthet[starthet < 0] <- 0
+    endhet <- endhets[range] - tracewidth * (j - 1)
+    endhet[endhet > tracewidth] <- tracewidth
+    lab1 <- basecalls1[range]
+    lab2 <- basecalls2[range]
+    lab3 <- as.character(which(range))
+    basepos1 <- lab3[1]
+    lab3[!grepl("0$",lab3)] <- ""
+    pos <- aveposition[range] - tracewidth * (j - 1)
+    colors1 <- colorvector1[range]
+    colors2 <- colorvector2[range]
+    starttrim <- starttrims[range] - tracewidth * (j - 1)
+    endtrim <- endtrims[range] - tracewidth * (j - 1)
+    plotrange <- i:min(i + tracewidth, nrow(traces))
+    plot(traces[plotrange, 1], type = "n", ylim = ylims, 
+         ylab = "", xaxt = "n", bty = "n", 
+         xlab = "", yaxt = "n", xlim = c(1,tracewidth))
+    if (showhets == TRUE) {
+      rect(starthet, 0, endhet, ylims[2], col = "#D5E3F7", 
+           border = "#D5E3F7")
+    }
+    if (showtrim == TRUE) {
+      rect(starttrim, 0, endtrim, ylims[2], col = "red", 
+           border = "transparent", density = 15)
+    }
+    lines(traces[plotrange, 1], col = "green")
+    lines(traces[plotrange, 2], col = "blue")
+    lines(traces[plotrange, 3], col = "black")
+    lines(traces[plotrange, 4], col = "red")
+    mtext(basepos1, side = 2, line = 0, 
+          cex = cex.mtext)
+    for (k in 1:length(lab1)) {
+      if (showcalls == "primary" | showcalls == "both") {
+        if (is.na(basecalls1[1]) & basecallwarning1 == 
+            0) {
+          warning("Primary basecalls missing")
+          basecallwarning1 = 1
+        }
+        else if (length(lab1) > 0) {
+          axis(side = 3, at = pos[k], labels = lab1[k], 
+               col.axis = colors1[k], family = "mono", 
+               cex = cex.base, line = ifelse(showcalls == 
+                                               "both", 0, -1), tick = FALSE)
+          axis( side=1, at = pos[k], labels = lab3[k], 
+                col.axis = "gray", family="sans", cex=cex.base*0.5, tick=TRUE )
+        }
+      }
+      if (showcalls == "secondary" | showcalls == 
+          "both") {
+        if (is.na(basecalls2[1]) & basecallwarning2 == 
+            0) {
+          warning("Secondary basecalls missing")
+          basecallwarning2 = 1
+        }
+        else if (length(lab2) > 0) {
+          axis(side = 3, at = pos[k], labels = lab2[k], 
+               col.axis = colors2[k], family = "mono", 
+               cex = cex.base, line = -1, tick = FALSE)
+        }
+      }
+    }
+    j = j + 1
+  }
+  if(!is.null(title)) title(title, outer=TRUE, adj=0.05, family="serif")
+  if (!is.null(filename)) {
+    dev.off()
+    cat(paste("Chromatogram saved to", filename, "in the current working directory"))
+  }
+  else par(originalpar)
+}
+
+# Performs alignments of forward and reverse reads (optionally performing read reversal for reverse reads)
+# Designed for magrittr/piped workflow, returning a list (column) of forward/reverse read alignments
+align_seqs <- function( forward_seq, reverse_seq, rev=TRUE, method=c("ClustalW", "ClustalOmega", "Muscle", "DECIPHER") ){
+  
+  method <- match.arg(method)                                                         # identify primary method for alignment
+
+  if(rev) reverse_seq <- lapply(reverse_seq, reverseComplement)                       # get reverse complement of reverse sequences, if specified
+  
+  if( method=="DECIPHER" ){
+    aligned_seqs <- purrr::map2(forward_seq, reverse_seq, function(.x,.y){
+      paired_seqs <- DNAStringSet(list(.x,.y))
+      alignment <- DECIPHER::AlignSeqs(paired_seqs, verbose=FALSE)
+      DECIPHER::StaggerAlignment(alignment, verbose=FALSE)
+    })
+  } else {
+    aligned_seqs <- purrr::map2(forward_seq, reverse_seq, function(.x,.y){
+      paired_seqs <- DNAStringSet(list(.x,.y))
+      tryCatch(
+        expr={
+          alignment <- DNAStringSet(msa::msa(paired_seqs, method=method, verbose=FALSE))
+          DECIPHER::StaggerAlignment(alignment, verbose=FALSE)
+        }, 
+        error=function(e){
+          message("msa::msa() encountered the following error when attempting alignment:")
+          message(e$message)
+          message("Resorting to DECIPHER::AlignSeqs().")
+          alignment <- DECIPHER::AlignSeqs(paired_seqs,verbose=FALSE)
+          DECIPHER::StaggerAlignment(alignment, verbose=FALSE)
+        }
+      )
+    })
+  }
+
+  return(aligned_seqs)
+}
+
+# Performs alignments of forward and reverse reads (optionally performing read reversal for reverse reads)
+# Designed for magrittr/piped workflow, returning a list (column) of forward/reverse read alignments
+align_seqs_with_primers <- function( forward_seq, reverse_seq, rev=TRUE, method=c("ClustalW", "ClustalOmega", "Muscle", "DECIPHER"), primers ){
+  
+  method <- match.arg(method)                                                         # identify primary method for alignment
+
+  if(rev) reverse_seq <- lapply(reverse_seq, reverseComplement)                       # get reverse complement of reverse sequences, if specified
+  
+  if( method=="DECIPHER" ){
+    aligned_seqs <- purrr::map2(forward_seq, reverse_seq, function(.x,.y){
+      paired_seqs <- c(primers, DNAStringSet(list(.x,.y)))
+      alignment <- DECIPHER::AlignSeqs(paired_seqs, verbose=FALSE)
+      DECIPHER::StaggerAlignment(alignment, verbose=FALSE)
+    })
+  } else {
+    aligned_seqs <- purrr::map2(forward_seq, reverse_seq, function(.x,.y){
+      paired_seqs <- c(primers, DNAStringSet(list(.x,.y)))
+      tryCatch(
+        expr={
+          alignment <- DNAStringSet(msa::msa(paired_seqs, method=method, verbose=FALSE))
+          DECIPHER::StaggerAlignment(alignment, verbose=FALSE)
+        }, 
+        error=function(e){
+          message("msa::msa() encountered the following error when attempting alignment:")
+          message(e$message)
+          message("Resorting to DECIPHER::AlignSeqs().")
+          alignment <- DECIPHER::AlignSeqs(paired_seqs,verbose=FALSE)
+          DECIPHER::StaggerAlignment(alignment, verbose=FALSE)
+        }
+      )
+    })
+  }
+  
+  trimmed_alignment <- lapply( aligned_seqs, trim_alignment )
+
+  return(trimmed_alignment)
+}
+
+trim_alignment <- function(alignment){
+  # trims an alignment to the template between two primers
+  # assumes alignment is a DNAStringSet with the first two elements being the forward and reverse primers, respectively
+  
+  alignment_length <- nchar(alignment[[1]])
+  upstream_primer_site <- alignment_length-(stringr::str_locate(reverse(alignment[[1]]), "[^-]")[1]-2)  # find where upstream primer ends in the alignment
+  downstream_primer_site <- stringr::str_locate(alignment[[2]], "[^-]")[1]-1         # find where the downstream primer begins in the alignment
+  
+  if( downstream_primer_site <= upstream_primer_site ){
+    message("primer sites not well defined; ignoring primer trim")
+    trimmed_alignment <- alignment[-c(1:2)]
+  } else {
+    trimmed_alignment <- subseq(alignment,upstream_primer_site,downstream_primer_site)[-c(1:2)]
+  }
+  
+  return(trimmed_alignment)
+}
+
+compile_seqs <- function( seqs ){
+  
+  seqs <- lapply(seqs, DNAStringSet)
+  seqs <- do.call(c, seqs)
+  
+  return(seqs)
+  
+}
+
+longest_seq <- function( seqs ){
+  
+  seqs <- lapply(seqs, DNAString)
+  lens <- sapply(seqs, nchar)
+  longest_seq <- seqs[which.max(lens)]
+  
+  return(longest_seq)
+  
+}
+
+# trim_seq <- function( abif, seq=c("primary","secondary") ){
+#   
+#   seq <- switch(match.arg(seq), 
+#                 "primary"={primarySeq(makeBaseCalls(sangerseq(abif)))}, 
+#                 "secondary"={secondarySeq(makeBaseCalls(sangerseq(abif)))})
+#   
+#   trims <- attr(abif, "mott_trim")
+#   
+#   if(is.null(trims)){
+#     abif <- trim_mott(abif, fix=TRUE)
+#     trims <- attr(abif,"mott_trim")
+#   }
+#   
+#   if(trims["start"]==0) trims["start"] <- 1
+#   
+#   seq <- subseq(seq, start=trims["start"], end=trims["finish"])
+#   
+#   return(seq)
+#   
+# }
+
+get_consensus <- function( reads, secondary=FALSE ){
+
+  seq <- ifelse(secondary, "secondary", "primary")                                                       # fieldname for basecalled sequence extraction from ABIF read
+
+  consensus_seqs <- reads %>%
+    {if(secondary){                                                                                      # if secondary basecalled sequences are requested
+      filter(., N_SecondaryPeaks>0)                                                                      #   keep only reads with secondary peaks identified
+    } else .} %>%
+    rowwise() %>% mutate( Seq=list(DNAString(Read@data$seq[[seq]])) ) %>%                                # extract the trimmed read from the ABIF object
+    pivot_wider( id_cols=SPJ, names_from=Sense, values_from=Seq, values_fill=list(DNAString("")) ) %>%   # pivot to row-per-sample format, spreading forward and reverse reads across columns
+    mutate( Alignment=align_seqs(Forward, Reverse, method="Muscle") ) %>%                                # perform pairwise alignment of forward and reverse reads
+    rowwise() %>% mutate( Consensus=list(DECIPHER::ConsensusSequence(Alignment,noConsensusChar="N")),    # extract consensus sequences from alignments
+                          NoCons=stringr::str_count(Consensus,"N") )                                     # count instances of lack of consensus in each sample
+  
+  return(consensus_seqs)
+
+}
+
+write_fasta <- function( consensus_seqs, seq_col, id_col, file=NULL ){
+  
+  seq_quo <- enquo(seq_col); id_quo <- enquo(id_col)                                  # quote column names
+  
+  query <- sapply(pull(consensus_seqs,!!seq_quo), as.character, USE.NAMES=FALSE)      # pull out query sequences and coerce to character
+  query_names <- paste0(">", pull(consensus_seqs,!!id_quo))                           # pull out query IDs and format for FASTA
+  query <- c(query_names, query)[order(c(seq_along(query_names), seq_along(query)))]  # coalesce IDs and sequences
+  
+  writeLines(query, file)                                                             # write query sequences to file
+  
+}
+
+```
+
+```{r blastFns}
+
+blastn <- function( db, query, query_names=NULL, task=c("megablast", "blastn", "short", "dc"), options=blastControl() ){
+  
+  query <- sapply( query, as.character, USE.NAMES=FALSE )
+  if( !is.null(query_names) ){
+    query_names <- paste0(">", query_names)
+    query <- c(query_names, query)[order(c(seq_along(query_names), seq_along(query)))]
+  }
+  task <- switch(match.arg(task), "megablast"="megablast", "blastn"="blastn", "short"="blastn-short", "dc"="dc-megablast")
+  args <- c( dbflag="-db", db=db, taskflag="-task", task=task, options )
+  
+  blast_res <- system2( "blastn", args=args, input=query, stdout=TRUE )
+  parsed_blast_res <- parse_blast_res( blast_res, args["outfmt"], args["fmtstr"] )
+  
+  return(parsed_blast_res)
+  
+}
+
+blastnControl <- function(evalue=10, entrez_query=NULL, outfmt=6, fmtstr=NULL, remote=TRUE, arg_string=NULL ){
+  
+  if(!is.numeric(evalue))     stop("Control parameter 'evalue' must be a real number!")
+  if(!outfmt%in%0:18)     stop("Not a valid output format.")
+  if((!(outfmt%in%c(6,7,10))) & !is.null(fmtstr) ){
+    message("Format string only meaningful for tabular formats (did you mean outfmt 6, 7, or 10?). Ignoring parameter 'fmtstr'.")
+    fmtstr <- NULL
+  }
+  
+  # if( !is.null(fmtstr) ){                                                          # check validity of fmtstr fields
+  #   fmtfieldlist <- strsplit(fmtstr, "\\s")[[1]]
+  #   fmtfieldlist <- split(fmtfieldlist, fmtfieldlist %in% fmtfields())
+  #   if( !is.null(fmtfieldlist$`FALSE`) ){
+  #     message(sprintf("The following field codes are not valid format field strings: %s", paste(fmtfieldlist$`FALSE`, collapse=", ")))
+  #     message("Ignoring those fields for now. Check `fmtspec` for a listing of valid field codes.")
+  #   }
+  #   fmtstr <- if( is.null(fmtfieldlist$`TRUE`) ) NULL else paste(fmtfieldlist$`TRUE`, collapse=" ")
+  # }
+  
+  dotargs <- as.character(as.list(match.call(expand.dots=FALSE)[-1])$`...`)
+  
+  controls <- c(
+    evalueflag="-evalue", evalue=evalue, 
+    outfmtflag="-outfmt", outfmt=outfmt, fmtstr=fmtstr, 
+    arg_string, 
+    remote=if(remote) "-remote" else NULL
+  )
+  
+  return(controls)
+  
+}
+
+blastControl <- function(...){
+  
+  app <- switch(as.character(sys.call(-1)[1]),        # use the name of calling function to identify which BLAST program is being invoked (influences which arguments are available)
+                blastn="blastnControl", blastp="blastpControl", blastx="blastxControl", 
+                tblastx="tblastxControl", tblastn="tblastnControl", psiblast="psiblastControl", 
+                rpsblast="rpsblastControl", rpstblastn="rpsblastnControl")
+  
+  args <- as.list(match.call(expand.dots=TRUE)[-1])   # pull the arguments passed to the current function for passing on to the appropriate control function
+  
+  do.call(app, args)                                  # invoke the appropriate control function, passing on the present arguments
+  
+}
+
+parse_blast_res <- function( res, outfmt, fmtstr ){
+  
+  if( outfmt %in% c("6","7","10") ){
+    tsep <- switch( outfmt, "6"="\t", "7"="\t", "10"=",")
+    if(is.na(fmtstr)) fmtstr <- "qaccver saccver pident length mismatch gapopen qstart qend sstart send evalue bitscore"
+    res_df <- tryCatch(
+      {
+        rdr_msg_inds <- grep("^FASTA-Reader:", res)                                                                         # check to see whether the results contain any FASTA reader errors
+        if( length(rdr_msg_inds)>0 ){                                                                                       # if they do...
+          rdr_msg <- res[rdr_msg_inds]                                                                                      #   get the messages
+          query <- get("query", parent.frame())                                                                             #   pull the BLAST query from the parent environment
+          rdr_msg <- sapply( rdr_msg, function(.msg){                                                                       #   now, for every error message...
+            q_id <- as.numeric(stringr::str_extract(.msg, "(?<=line )\\d+(?=:)"))                                           #     get the number of the aberrant query string
+            q_name <- case_when( grepl("^>",query[q_id-1]) ~ gsub( "^>(.*)$",paste0(q_id, " (\\1)"),query[q_id-1]),         #     check to see if the query has a name (preceding ">" line)
+                                 TRUE ~ paste(q_id) )                                                                       # 
+            q_pos <- as.numeric(stringr::str_extract_all(.msg, "\\d+(?!:)", simplify=TRUE))                                 #     identify bad positions within query string
+            q_codes <- paste0("(",sapply(q_pos, function(.pos) substr(query[q_id],.pos,.pos)),")")                          #     grab error-causing residue codes
+            q_errors <- paste(q_pos, q_codes, sep=" ", collapse=", ")                                                       #     insert error-causing residue codes for user's information
+            .msg <- gsub("(?<=\\d: ).+$", q_errors, .msg, perl=TRUE)                                                        #     replace bad codes in the error message
+            .msg <- gsub("(?<=line )\\d+(?=:)", q_name, .msg, perl=TRUE)                                                    #     replace query name in the error message
+            .msg                                                                                                            #     return the message
+          }, USE.NAMES=FALSE )                                                                                              #  
+          message("The BLAST+ FASTA reader encountered the following issues in the input:")                                 #   let the reader know that there were issues
+          message(paste0(paste0("\t",rdr_msg), sep="\n"))                                                                   #   print out the edited error messages
+          res <- res[-rdr_msg_inds]                                                                                         #   send back the remaining reader output as the results
+        }                                                                                                                   # 
+        read.table(textConnection(res), sep=tsep, quote="" )                                                                # read the results according to the specified format
+      }, 
+      error=function(e){                                                                                                    # in case there's an error parsing the reults as coded above
+        message("Error parsing BLAST+ output. Returning raw results. Here's the original error given:")                     # let the reader know
+        message(paste0("\t",e))                                                                                             # print out the error
+        return(res)                                                                                                         # return the unparsed results
+      }
+    )
+    names(res_df) <- strsplit(fmtstr, split="\\s")[[1]]
+  } else {
+    message( "Parsing not yet implemented for non-tabular output formats. Returning un-parsed results. Sorry!" )
+    res_df <- res
+  }
+  
+  return(tibble::tibble(res_df))
+  
+}
+
+parse_blast_query <- function(query){
+  
+  if(is.list(query)){
+    query <- sapply(query,as.character)
+  }
+  if(class(query)=="DNAStringSet"){
+    query <- as.character(query)
+    if(!is.null(query_names <- names(query))){
+      query_names <- paste0(">",names(query))
+      query <- c(query_names, query)[order(c(seq_along(query_names), seq_along(query)))]
+    }
+  } else if(class(query)=="DNAString"){
+    query <- as.character(query)
+  } else if(is.character(query) & !is.null(query_names <- names(query))){
+    query_names <- paste0(">",names(query))
+    query <- c(query_names, query)[order(c(seq_along(query_names), seq_along(query)))]
+  }
+  
+  return(query)
+  
+}
+
+```
+
+```{r entRez-xml-Fns}
+
+get_orgn <- function( accession_no, retmax=50){
+  
+  esterm <- paste( accession_no, "[ACCN]", sep="", collapse=" OR ")
+  accn_search <- rentrez::entrez_search(db="nucleotide", term=esterm, use_history=TRUE )
+  
+  n_records <- accn_search$count
+  
+  organism <- vector("character", n_records)
+  
+  for( i in seq(0, n_records, retmax) ){
+    entrez_records <- rentrez::entrez_fetch(db="nucleotide", web_history=accn_search$web_history, rettype="gb", retmode="xml", retmax=retmax, retstart=i)
+    parsed_records <- XML::xmlParse(entrez_records)
+    organism[(i+1):min(i+retmax,n_records)] <- XML::xpathSApply(parsed_records, "//GBSet/GBSeq/GBSeq_organism", XML::xmlValue)
+  }
+  
+  return(organism)
+  
+}
+
+get_orgn_df <- function( .data, accession_col, orgn_col ){
+  
+  accession_col <- enquo(accession_col)
+  orgn_col <- enquo(orgn_col)
+  
+  accession_nos <- unique(pull(.data, !!accession_col))
+  orgns <- get_orgn(accession_nos)
+  
+  orgn_match <- bind_cols( !!accession_col := accession_nos, 
+                           !!orgn_col := orgns )
+
+  .data <- left_join( .data, orgn_match, by=as_name(accession_col) )
+  
+  return(.data)
+  
+}
+
+read_blast_xml <- function( file, alignment=FALSE ){
+  # imports and parses BLAST XML2 search results tree, returning the document as a tibble
+  
+  search_trees <- read_xml( file ) %>%                 # import the document
+    xml_find_all( ".//d1:Search" )                     # and step down to the level of individual searches/queries
+  
+  n_trees <- length(search_trees)                      # compute the number of query trees to parse
+  
+  blast_dfs <- vector("list", n_trees)                 # initialize a list to hold the individual search result tibbles
+  
+  for( i in 1:n_trees ){                               # walk through the search result trees
+    blast_dfs[[i]] <- parse_blast(search_trees[i], alignment=alignment) # and convert them to tibbles
+  }
+  
+  return(bind_rows(blast_dfs))                         # bind the tibbles and return them to the user
+  
+}
+
+parse_blast <- function( blast_search, alignment=FALSE){
+  # parses the XML2 results of a single blast query into a hit table, returning the table as a tibble
+  # NOTE that some hits have multiple descriptions (i.e., multiple accession nos. and scientific names for a given set of hsp params), 
+  # while others return multiple hsp param sets for a given description. either case, parse_blast() gets only the FIRST instance of each
+  # field encountered within a given result
+
+  hit_table <- tibble(
+    q_id     =xml_find_first(blast_search, ".//d1:query-id") %>% xml_text() %>% gsub("^Query_","",.),  # query/search ID
+    q_name   =xml_find_first(blast_search, ".//d1:query-title") %>% xml_text(),                        # query/search name (user-supplied sequence identifier)
+    accession=xml_find_all(blast_search, ".//d1:HitDescr[1]/d1:accession") %>% xml_text(),             # subject accession no.
+    hit_no   =xml_find_all(blast_search, ".//d1:Hit/d1:num") %>% xml_integer(),                        # hit ordinal
+    sciname  =xml_find_all(blast_search, ".//d1:HitDescr[1]/d1:sciname") %>% xml_text(),               # ........scientific name
+    bitscore =xml_find_all(blast_search, ".//d1:Hsp[1]/d1:bit-score") %>% xml_double(),                # bit score
+    score    =xml_find_all(blast_search, ".//d1:Hsp[1]/d1:score") %>% xml_double(),                    # score
+    evalue   =xml_find_all(blast_search, ".//d1:Hsp[1]/d1:evalue") %>% xml_double(),                   # expected value
+    identity =xml_find_all(blast_search, ".//d1:Hsp[1]/d1:identity") %>% xml_integer(),                # identity score (for calculating percent identity)
+    q_len    =xml_find_first(blast_search, ".//d1:query-len") %>% xml_integer(),                       # length of query sequence
+    q_start  =xml_find_all(blast_search, ".//d1:Hsp[1]/d1:query-from") %>% xml_integer(),              # start position of alignment within query sequence
+    q_end    =xml_find_all(blast_search, ".//d1:Hsp[1]/d1:query-to") %>% xml_integer(),                # end position of alignment within query sequence
+    h_len    =xml_find_all(blast_search, ".//d1:Hit/d1:len") %>% xml_integer(),                        # length of hit/subject sequence
+    h_start  =xml_find_all(blast_search, ".//d1:Hsp[1]/d1:hit-from") %>% xml_integer(),                # start position of alignment within hit/subject sequence
+    h_end    =xml_find_all(blast_search, ".//d1:Hsp[1]/d1:hit-to") %>% xml_integer(),                  # end position of alignment within hit/subject sequence
+    align_len=xml_find_all(blast_search, ".//d1:Hsp[1]/d1:align-len") %>% xml_integer(),               # length of aligned sequence
+    gaps     =xml_find_all(blast_search, ".//d1:Hsp[1]/d1:gaps") %>% xml_integer()                     # number of gaps in alignment
+  ) %>% 
+    mutate( perc_ident=(identity/align_len)*100 ) %>% select(-identity) %>%                            # compute percent identity
+    {if(alignment){                                                                                    # if the alignment is desired...
+      mutate( ., q_seq=xml_find_all(blast_search, ".//d1:Hsp[1]/d1:qseq") %>% xml_text(),              #   grab the query sequence
+                 h_seq=xml_find_all(blast_search, ".//d1:Hsp[1]/d1:hseq") %>% xml_text() ) %>%         #   and the hit sequence
+      mutate( across(q_seq:h_seq, ~gsub("CREATE_VIEW|\\n", "", .) ) ) %>%                              #   I was encountering a few extraneous tags in the XML content; if found, remove them
+      rowwise() %>% mutate( alignment=list(                                                            #   convert sequences to a DNAStringSet
+        Biostrings::DNAStringSet(c_across(q_seq:h_seq))
+      ) ) %>%
+      select(-c(q_seq:h_seq))
+    } else { . }}
+  
+  return(hit_table)
+
+}
+
+```
+
+```{r global}
+primers <- c(Forward="CATATATTAAGAGAATTATGGAG", Reverse="AGAGGTGTAGCATATCTATCTAC")            # HaemNF/HaemNR2 [PCR] primers (580 bp)
+primers_target <- c(Forward="ATGGTGCTTTCGATATATGCATG", Reverse="GCATTATCTGGATGTGATAATGGT")    # HaemF/HaemR2 [lineage/target] primers (479 bp)
+```
+
+## IMPORT AND CLEAN READS
+
+```{r impoRt}
+
+# seqfiles <- data.frame( ABIF=list.files( "data/sequence/reads", pattern="\\.ab1", full.names=TRUE, recursive=TRUE ) ) %>%     # pull names of all ABI files in the sequence reads directory
+#   filter( !grepl("2020-09-12", ABIF) ) %>%                                                                                    # exclude files from the preliminary (Eurofins) sampling batch
+#   mutate( ID=gsub("\\.ab1", "", basename(ABIF)) ) %>% separate( ID, c("DilutionID", "Sense", "Well", "Index"), sep="_" ) %>%  # identify the associated sample information for matching to database
+#   mutate(Index=as.numeric(Index)) %>% replace_na( list(Index=1) ) %>% select( ABIF, DilutionID, Sense, Index )                # clean up data.frame
+# 
+# reads <- readxl::read_xlsx("data/pcr-results_BCP_2019.xlsx", sheet="Sequencing", na=c("."," ")) %>%                           # bring in sample sequencing metadata
+#   filter(                                                                                                                     # filter out records...
+#     !is.na(SeqDate),                                                                                                          #   that don't yet have results
+#     DilutionID!="PGEM",                                                                                                       #   for PGEM controls
+#     Align == 1 ) %>%                                                                                                          #   of manually-identified duplicates, blanks, and poor reads
+#   left_join( seqfiles, by=c("DilutionID", "Sense", "Index") ) %>%                                                             # merge with filename frame
+#   # filter( SPJ%in%c("PBFW1202","WEEB48","SPFW2322","PBFW1921") ) %>%                                                         # subset for testing
+#   mutate( Sense=case_when( Sense=="F" ~ "Forward", Sense=="R" ~ "Reverse", TRUE ~ NA_character_ ),                            # rename sense levels to avoid references to `F` (R interprets as logical)
+#           TrimPrimer=primers[(!Sense=="Reverse")+1] ) %>%                                                                     # pull in primers to use for trimming ends
+#   rowwise() %>% mutate( TargetPrimers=list(primers_target[if(Sense=="Forward") 1:2 else 2:1]) ) %>%
+#   rowwise() %>% mutate( Read=list(read_abif(ABIF, TrimPrimer, target_primers=NULL)),                                          # read ABIF data for each sequence, identify Mott trim locations and secondary peaks
+#                         SNratio=list(get_sn_ratio(Read)),                                                                     # pull signal:noise ratio (quality summary) out of ABIF object
+#                         SecondaryPeaks_df=list(Read@data$secondary_peaks %>% filter(!trimmed)),                               # pull secondary peak data out of ABIF object
+#                         N_SecondaryPeaks=nrow(SecondaryPeaks_df) ) %>%                                                        # identify the number of untrimmed secondary peaks in each read
+#   unnest( SNratio ) %>% select(RunID, SPJ, Sense, DilutionID, Read, matches("^SNq_"), matches("SecondaryPeaks") )             # housekeeping
+# 
+# save(reads, file="data/sequence/reads/HAEMNF-HAEMNR2-reads_BCP_2019.RData")
+
+
+## CURRENT SAVED VERSION does not implement target trimming; no results as yet from that particular feature
+
+load("data/sequence/reads/HAEMNF-HAEMNR2-reads_BCP_2019.RData")
+
+```
+
+## BASECALLING CHAIN
+
+The raw ABIF data (accessible through `abif` objects) includes several basecalled sequences stored in its data slot. The `abif@data$PBAS.2` and `abif@data$PBAS.1` include the unedited and edited primary basecalled sequences, respectively. The item `abif@data$P2BA.1` includes secondary basecalls.
+
+Most functions in the `sangerseqR` package operate only on `sangerseq` objects. Coercion of `abif` objects to the `sangerseq` signature involves slight modifications of the internal basecalled sequences. Both sequences (primary and secondary) are first stripped of unrecognized characters (i.e., not in `Biostrings::DNA_ALPHABET`), then subsetted to include only calls corresponding to the unedited base locations (`abif@data$PLOC.2`). I believe the first transformation shouldn't be an issue with my ABIF data (and I've not yet encountered indicated warning about invalid characters). The second transformation should only trim basecalls from the 3' end of the sequence, which is generally trimmed anyway by Mott's method. Universally in the present set of reads (test with `sapply(reads$Read, function(.abif) nchar(.abif@data$PBAS.2)-length(.abif@data$PLOC.2)`)), this only results in a trimming of a single basecall from the 3' ends. Thus, the internal `sangerseq` primary basecalled sequences are differ from the internal `abif` primary basecalled sequences by a single base (`sapply(reads$Read,function(.abif)nchar(.abif@data$PBAS.2)-nchar(sangerseq(.abif)@primarySeq))`).
+
+A final step in the basecalling chain involves making base calls using the `sangerseqR` function `makeBaseCalls()`, which operates on `sangerseq` objects. This function is intended to improve the accuracy of secondary basecalls, but in general involves a re-analysis of the trace data to identify basecall windows and assign both primary and secondary basecalls. In general, the internal and basecalled sequences appear to be very similar, but may involve slight discrepancies (when noise is high) and a trimming of a handful (0–4 in the present sample) of basecalls from the 5' end of the read.
+
+```{r consensusR}
+
+cons_1_seqs <- get_consensus(reads)                             # get primary consensus sequences
+cons_2_seqs <- get_consensus(reads, secondary=TRUE)             # get secondary consensus sequences (when available)
+
+# write_fasta(cons_1_seqs, Consensus, SPJ, sprintf("data/sequence/fasta/HAEM-Primary-Consensus-Sequences_%s.FASTA", format(Sys.Date(), "%Y-%m-%d")))
+# write_fasta(cons_2_seqs, Consensus, SPJ, sprintf("data/sequence/fasta/HAEM-Secondary-Consensus-Sequences_%s.FASTA", format(Sys.Date(), "%Y-%m-%d")))
+
+##################################################################################
+###               PERFORM BLASTn SEARCH USING NCBI WEB INTERFACE               ###
+###----------------------------------------------------------------------------###
+###          results saved to 'data/sequence/blast/RID-Alignment.xml'          ###
+##################################################################################
+
+```
+
+```{r}
+
+seq <- "primary"
+haem_primers <- DNAStringSet(primers_target)
+haem_primers[2] <- reverseComplement(haem_primers[2])
+
+cons_1_trimmed_seqs <- reads %>% 
+  rowwise() %>% mutate( Seq=list(DNAString(Read@data$seq[[seq]])) ) %>%                                # extract the trimmed read from the ABIF object
+  pivot_wider( id_cols=SPJ, names_from=Sense, values_from=Seq, values_fill=list(DNAString("")) ) %>%   # pivot to row-per-sample format, spreading forward and reverse reads across columns
+  mutate( Alignment=align_seqs_with_primers(Forward, Reverse, method="Muscle", primers=haem_primers) ) %>%                                # perform pairwise alignment of forward and reverse reads
+  rowwise() %>% mutate( Consensus=list(DECIPHER::ConsensusSequence(Alignment,noConsensusChar="N")),    # extract consensus sequences from alignments
+                        NoCons=stringr::str_count(Consensus,"N") )  
+
+```
+
+
+## PARSE BLAST RESULTS / PERFORM MalAvi SEARCH
+
+```{r blastR}
+
+library( xml2 )
+library( malaviR )
+
+####################
+###   Controls   ###
+####################
+
+RID_2ary <- "3RTVPU9H01R"                                     # specify the RID for the latest BLAST query (secondary consensus sequences)
+RID_1ary <- "3RSWJJC701R"                                     # specify the RID for the latest BLAST query (primary consensus sequences)
+
+cons_seqs <- cons_1_seqs
+RID <- RID_1ary
+
+####################
+###   Searches   ###
+####################
+
+blast_df <- read_blast_xml(sprintf("data/sequence/blast/%s-Alignment.xml",RID), alignment=FALSE)   # import and parse BLAST results
+
+malavi_df <- cons_seqs %>%                                    # perform a BLAST search of the MalAvi database using the consensus queries
+  rowwise() %>% mutate( malavi_blast=list(tryCatch(
+    expr={blast_malavi(Consensus, hits=10) %>% tibble::rowid_to_column()}, 
+    warning=function(w){                                      #### SCHO 9 consensus sequence fails to match. Reverse read is pretty low quality, 
+      message(sprintf("Failed for %s, with warning:", SPJ))   #### but forward read looks O.K., and doesn't throw any errors BLASTing.
+      message(sprintf("%s", w))                               #### I'll BLAST the trimmed forward read and merge in those results.
+      
+      nf <- nchar(Forward)
+      nr <- nchar(Reverse)
+      
+      if( nf > nr ){
+        message("Trying forward read...")
+        blast_malavi(Forward, hits=10) %>% 
+          tibble::rowid_to_column()
+      } else {
+        message("Trying reverse read...")
+        blast_malavi(Reverse, hits=10) %>% 
+          tibble::rowid_to_column()
+      }
+    }
+  )) )  %>% 
+  select( SPJ, malavi_blast ) %>% unnest( malavi_blast ) %>% 
+  separate( Identities, c("Identity", "align_len"), sep="/" ) %>% 
+  mutate( gaps=gsub("/\\d+","",Gaps )) %>% 
+  mutate( across(c(Score, Identity, align_len, gaps), ~as.numeric(.x)) ) %>% 
+  mutate( perc_ident=Identity*100/align_len ) %>% 
+  select( hit_no=rowid, SPJ, lineage=Lineage, score=Score, perc_ident, gaps, align_len )
+
+
+########################################
+###   Select from among BLAST hits   ###
+########################################
+
+blast_selection_method <- 1                          # indicate selection method
+
+blast_hits <- blast_df %>% 
+  group_by(q_name) %>% 
+  {switch(                                           # conditional filtering based on blast selection method specification
+    blast_selection_method, 
+    filter(., hit_no==1),                            # selecting BLAST's top result ensure 1 hit per query, but is probably overly simplistic
+    filter(., bitscore==max(bitscore)),              # selecting based on maximum bitscore yields up to 4 (redundant?) hits per query (PBFW1877 [short seq] had 22 top hits)
+    filter(., bitscore==max(bitscore)) %>%           # further optimization by limiting to maximal alignment and minimal gaps doesn't help
+      filter(align_len==max(align_len)&gaps==min(gaps))
+  )} %>% 
+  mutate(genus=stringr::word(sciname,1,1)) %>% 
+  select( SPJ=q_name, NCBI=accession, NCBI_genus=genus )
+
+#########################################
+###   Select from among MalAvi hits   ###
+#########################################
+
+GLS <- extract_table("Grand Lineage Summary") %>%    # get lineage metadata for merging with hits
+  select( lineage=Lineage_Name, lineage_NCBI=accession, lineage_genus=genus )
+
+malavi_selection_method <- 1                         # indicate selection method
+
+malavi_hits <- malavi_df %>% 
+  group_by(SPJ) %>% 
+  {switch(                                           # conditional filtering based on blast selection method specification
+    malavi_selection_method, 
+    filter(., hit_no==1),                            # pick the first-listed hit for each query (ensures 1 hit/query, but I'm unsure how order arises from identical matches in MalAvi db)
+    filter(., score==max(score)),                    # yields up to 3 (redundant?) hits per query; 68×1 hit/query, 7×2 hits/query, 1×3 hits/query
+    filter(., score==max(score)) %>%                 # slightly improved (3×2 hits/query, 1×3 hits/query)
+      filter(align_len==max(align_len)&gaps==min(gaps))
+  )} %>% 
+  select( SPJ, lineage ) %>% 
+  left_join( GLS, by="lineage" )
+
+#########################################
+###    Merge BLAST and MalAvi hits    ###
+###         and write to file         ###
+#########################################
+
+top_hits <- full_join( blast_hits, malavi_hits, by="SPJ" ) %>% 
+  select( SPJ, everything() )
+
+# write.csv(top_hits, sprintf("data/sequence/BCP_Primary-Consensus-Hits_%s.csv",format(Sys.Date(),"%Y-%m-%d")), row.names=FALSE)
+# write.csv(top_hits, sprintf("data/sequence/BCP_Secondary-Consensus-Hits_%s.csv",format(Sys.Date(),"%Y-%m-%d")), row.names=FALSE)
+
+```
+
+## DEPRECATED
+
+```{r blastexploRe}
+
+blast_df %>% 
+  filter( hit_no<=4 ) %>% 
+  mutate( sciname=stringr::word(sciname,1,1) ) %>% 
+  select( q_name, sciname ) %>% 
+  distinct() %>% 
+  with(., table(sciname))
+  # filter( sciname=="Plasmodium" )
+
+```
+
+```{r}
+
+library( malaviR )
+
+malavi_seqs <- extract_alignment("all seqs")
+
+conseqs <- do.call(c, cons_1_seqs$Consensus)
+names(conseqs) <- cons_1_seqs$SPJ
+
+trimalign <- msa(c(HaemF=DNAStringSet(primers_target[1]), conseqs, HaemR2=reverseComplement(DNAStringSet(primers_target[2]))), method="Muscle")
+falign <- trimalign@unmasked$Forward
+ralign <- trimalign@unmasked$Reverse
+
+```
+
+```{r troubleshooting, include=FALSE}
+
+reads %>% 
+  rowwise() %>% mutate( PLen=nchar(Read@data$seq$primary) ) %>% 
+  filter(PLen<480) %>% arrange(SPJ)
+
+cons_seqs %>% mutate(PLen=nchar(Consensus)) %>% 
+  arrange(-NoCons)
+
+reads %>% 
+  filter( SPJ=="SIHO6" ) %>% 
+  rowwise() %>% 
+  mutate( PSeq=Read@data$seq$primary ) %>% 
+  pull(PSeq) %>% DNAStringSet() -> siho6
+
+siho6[2] <- reverseComplement(siho6[2])
+
+msa::msa(siho6, method="Muscle", verbose=FALSE) %>% consensusString() %>% substr(169,284)
+
+siho6[1] %>% clipr::write_clip()
+siho6[2] %>% clipr::write_clip()
+
+seqs <- reads %>% rowwise() %>% 
+  mutate(PBAS.2 = Read@data$PBAS.2, 
+         Trimmed= Read@data$seq$primary, 
+         sSeq   = primarySeq(makeBaseCalls(sangerseq(Read)), string=TRUE))
+
+aligns <- seqs %>% 
+  alply( 1, .fun=function(.row){
+    pbas.2 <- DNAString(.row$PBAS.2)
+    trimmed <- DNAString(.row$Trimmed)
+    sSeq <- DNAString(.row$sSeq)
+    DECIPHER::AlignSeqs(DNAStringSet(list(pbas.2,trimmed,sSeq)),verbose=FALSE)
+  })
+
+q_excludes <- c("PBFW1202")                                                                                                        # some sequences were registering as AA sequences; removed for now
+
+r_excludes <- readxl::read_xlsx("data/pcr-results_BCP_2019.xlsx", sheet="Sequencing", na=c("."," ")) %>%                           # bring in sample sequencing metadata
+  filter(                                                                                                                     # filter out records...
+    !is.na(SeqDate),                                                                                                          #   that don't yet have results
+    DilutionID!="PGEM",                                                                                                       #   for PGEM controls
+    Align != 0 | is.na(Align) ) %>%                                                                                           #   of manually-identified duplicates, blanks, and poor reads
+  left_join( seqfiles, by=c("DilutionID", "Sense", "Index") ) %>%                                                             # merge with filename frame
+  filter( SPJ%in%q_excludes ) %>%                                                                                             # subset for testing
+  mutate( Sense=case_when( Sense=="F" ~ "Forward", Sense=="R" ~ "Reverse", TRUE ~ NA_character_ ),                            # rename sense levels to avoid references to `F` (R interprets as logical)
+          TrimPrimer=primers[(!Sense=="Reverse")+1] ) %>% 
+  rowwise() %>% mutate( Read=list(read_abif(ABIF, TrimPrimer)) )
+
+
+# #%>%                                                                                     # pull in primers to use for trimming ends
+#   rowwise() %>% mutate( Read=list(read_abif(ABIF, TrimPrimer)),                                                               # read ABIF data for each sequence, identify Mott trim locations and secondary peaks
+#                         SNratio=list(get_sn_ratio(Read)),                                                                     # pull signal:noise ratio (quality summary) out of ABIF object
+#                         SecondaryPeaks_df=list(Read@data$secondary_peaks %>% filter(!trimmed)),                               # pull secondary peak data out of ABIF object
+#                         N_SecondaryPeaks=nrow(SecondaryPeaks_df) ) %>%                                                        # identify the number of untrimmed secondary peaks in each read
+#   unnest( SNratio ) %>% select(RunID, SPJ, Sense, DilutionID, Read, matches("^SNq_"), matches("SecondaryPeaks") )             # housekeeping
+
+
+abif_f <- r_excludes %>% filter( SPJ=="PBFW1202"&Sense=="Forward" ) %>% pull(Read) %>% .[[1]]
+abif_r <- r_excludes %>% filter( SPJ=="PBFW1202"&Sense=="Reverse" ) %>% pull(Read) %>% .[[1]]
+
+tprimer_f <- DNAString(primers["Reverse"])
+tprimer_r <- DNAString(primers["Forward"])
+
+rawseq_f <- DNAString(abif_f@data$PBAS.2)
+rawseq_r <- DNAString(abif_r@data$PBAS.2)
+
+rawseqs <- DNAStringSet(list(rawseq_f,reverseComplement(rawseq_r)))
+
+trimseq_f <- DNAString(abif_f@data$seq$primary)
+trimseq_r <- DNAString(abif_r@data$seq$primary)
+
+trimseqs <- DNAStringSet(list(trimseq_f,reverseComplement(trimseq_r)))
+
+rawalign_msa <- msa::msa(rawseqs)
+trimalign_msa <- msa::msa(trimseqs)
+
+rawcons_msa <- DECIPHER::ConsensusSequence(rawalign_msa)
+trimcons_msa <- DECIPHER::ConsensusSequence(trimalign_msa)
+
+```
+
+```{r chRomatograms, include=FALSE}
+
+for( i in 1:nrow(reads) ){                                                                                                    # export trimmed chromatograms for review,
+  sec_peaks <- reads$N_SecondaryPeaks[i]                                                                                      # 
+  if( sec_peaks==0 ){                                                                                                         # separating reads that have secondary peaks to examine
+    chrom.dir <- "data/sequence/chromatograms/noSecondaryPeaks"
+  } else {
+    chrom.dir <- "data/sequence/chromatograms/SecondaryPeaks"
+  }
+  sense <- unlist(substr(reads$Sense[i],1,1))
+  chrom.prefix <- paste(reads$DilutionID[i], reads$SPJ[i], sense, sep="_")
+  chrom.title <- paste(reads$SPJ[i], reads$Sense[i], sep=" " )
+  chromatogram_2arypeaks( reads$Read[[i]], dir=chrom.dir, prefix=chrom.prefix, title=chrom.title )
+  cat("\n")
+}
+
+peaks_for_review <- reads %>%                                                                                                 # identify files and peak locations for review
+  filter(N_SecondaryPeaks>0) %>%                                                                                              # filter out files without untrimmed secondary peaks
+  mutate( Sense=unlist(substr(Sense,1,1)) ) %>% unnest( SecondaryPeaks_df ) %>%                                               # reconstruct filename for examination
+  select( SPJ, Sense, pcall=primary_basecall, scall=secondary_basecall, pos=position_trimmed )                                # housekeeping
+
+# write.csv( peaks_for_review, "data/sequence/chromatograms/secondary_peaks.csv", row.names=FALSE )
+
+```
+
+```{r oldConsensus, include=FALSE}
+
+cons_seqs <- reads %>% 
+  rowwise() %>% mutate( PSeq=list(DNAString(Read@data$seq$primary)) ) %>%                                                       # extract the trimmed read from the ABIF object
+  pivot_wider( id_cols=RunID:SPJ, names_from=Sense, values_from=PSeq, values_fill=list(DNAString("")) ) %>%                     # pivot to row-per-sample format, spreading forward and reverse reads across columns
+  mutate( RunID=case_when(SPJ=="WEEB48"~"HAEM-5.25", SPJ=="PBFW1496"~"HAEM-7.1", SPJ=="PBFW1756"~"HAEM-7.3",
+                          SPJ=="SCHO6"~"HAEM-5.14", SPJ=="SCHO9"~"HAEM-5.17", SPJ=="SIHO6"~"HAEM-5.5",
+                          SPJ=="SPFW2856"~"HAEM-7.20", SPJ=="SPFW2676"~"HAEM-6.18", TRUE~RunID) ) %>%          ## I sequenced WEEB48 twice, using 2 different HAEM rxn products. The forward read was good on one, the reverse good on the other,
+  group_by(RunID) %>% summarize( SPJ=unique(SPJ), across(Forward:Reverse, ~longest_seq(.x)) ) %>%              ## but neither had a good pair of reads. Upon inspection, the pairwise alignment looks good, so I've hard-coded a collapsing here.
+  mutate( Alignment=align_seqs(Forward, Reverse, method="Muscle") ) %>%                                                         # perform pairwise alignment of forward and reverse reads
+  rowwise() %>% mutate( Consensus=list(DECIPHER::ConsensusSequence(Alignment,noConsensusChar="N")),                             # extract consensus sequences from alignments
+                        NoCons=stringr::str_count(Consensus,"N") )                                                              # count instances of lack of consensus in each sample
+
+q_excludes <- c("")                                                                                                             # some sequences were registering as AA sequences; removed for now
+## EDIT: the default alignment (ClustalW) was generating a bad consensus read for SIHO6. Switching to MUSCLE (which is what Eastwood et al. 2019 used)
+## resulted in an improved consensus sequence for SIHO6, and didn't affect BLAST acceptance of any other inputs
+
+query <- sapply(cons_seqs$Consensus[!cons_seqs$SPJ%in%q_excludes], as.character, USE.NAMES=FALSE)                               # 
+query_names <- paste0(">", cons_seqs$SPJ[!cons_seqs$SPJ%in%q_excludes])
+
+query <- c(query_names, query)[order(c(seq_along(query_names),seq_along(query)))]
+
+# writeLines(query, sprintf("data/sequence/fasta/HAEM-Primary-Consensus-Sequences_%s.FASTA", format(Sys.Date(), "%Y-%m-%d")) )
+
+##################################################################################
+###               PERFORM BLASTn SEARCH USING NCBI WEB INTERFACE               ###
+###----------------------------------------------------------------------------###
+###          results saved to 'data/sequence/blast/RID-Alignment.xml'          ###
+##################################################################################
+
+cons_2seqs <- reads %>% 
+  filter( N_SecondaryPeaks>0 ) %>% 
+  rowwise() %>% mutate( SSeq=list(DNAString(Read@data$seq$secondary)) ) %>%                                                     # extract the trimmed read from the ABIF object
+  pivot_wider( id_cols=RunID:SPJ, names_from=Sense, values_from=SSeq, values_fill=list(DNAString("")) ) %>%                     # pivot to row-per-sample format, spreading forward and reverse reads across columns
+  mutate( RunID=case_when(SPJ=="WEEB48"~"HAEM-5.25", SPJ=="PBFW1496"~"HAEM-7.1", SPJ=="PBFW1756"~"HAEM-7.3",
+                          SPJ=="SCHO6"~"HAEM-5.14", SPJ=="SCHO9"~"HAEM-5.17", SPJ=="SIHO6"~"HAEM-5.5",
+                          SPJ=="SPFW2856"~"HAEM-7.20", SPJ=="SPFW2676"~"HAEM-6.18", TRUE~RunID) ) %>%          ## I sequenced WEEB48 twice, using 2 different HAEM rxn products. The forward read was good on one, the reverse good on the other,
+  group_by(RunID) %>% summarize( SPJ=unique(SPJ), across(Forward:Reverse, ~longest_seq(.x)) ) %>%              ## but neither had a good pair of reads. Upon inspection, the pairwise alignment looks good, so I've hard-coded a collapsing here.
+  mutate( Alignment=align_seqs(Forward, Reverse, method="Muscle") ) %>%                                                         # perform pairwise alignment of forward and reverse reads
+  rowwise() %>% mutate( Consensus=list(DECIPHER::ConsensusSequence(Alignment,noConsensusChar="N")),                             # extract consensus sequences from alignments
+                        NoCons=stringr::str_count(Consensus,"N") )                                                              # count instances of lack of consensus in each sample
+
+q2_excludes <- c("")                                                                                                             # some sequences were registering as AA sequences; removed for now
+## EDIT: the default alignment (ClustalW) was generating a bad consensus read for SIHO6. Switching to MUSCLE (which is what Eastwood et al. 2019 used)
+## resulted in an improved consensus sequence for SIHO6, and didn't affect BLAST acceptance of any other inputs
+
+query2 <- sapply(cons_2seqs$Consensus[!cons_2seqs$SPJ%in%q2_excludes], as.character, USE.NAMES=FALSE)                               # 
+query2_names <- paste0(">", cons_2seqs$SPJ[!cons_2seqs$SPJ%in%q2_excludes])
+
+query2 <- c(query2_names, query2)[order(c(seq_along(query2_names),seq_along(query2)))]
+
+# writeLines(query2, sprintf("data/sequence/fasta/HAEM-Secondary-Consensus-Sequences_%s.FASTA", format(Sys.Date(), "%Y-%m-%d")) )
+
+##################################################################################
+###               PERFORM BLASTn SEARCH USING NCBI WEB INTERFACE               ###
+###----------------------------------------------------------------------------###
+###          results saved to 'data/sequence/blast/RID-Alignment.xml'          ###
+##################################################################################
+
+```

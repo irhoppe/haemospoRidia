@@ -1,0 +1,73 @@
+---
+title: "Sequence Analysis Workflow"
+author: "Ian Hoppe"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  bookdown::html_document2:
+    theme: lumen
+---
+
+# PRÉCIS
+
+## Data/Motivation
+
+I have forward and reverse reads from PCR amplifications using the primers HaemNF/HaemNR2. The amplification target is a 580-bp region in the mitochondrial cytochrome *b* gene, and the binding sites are conserved across 3 genera of blood parasites: *Plasmodium*, *Haemoproteus*, and *Leucocytozoon*. In general, recent blood parasite work has focused primarily on parasite lineages, which are defined by a 479-bp region nested inside the PCR target. This region is flanked by the HaemF/HaemR2 primer-binding sites.
+
+For each sample, I need to identify the lineage causing infection (or lineages, if coinfection is occurring, as indicated by heterozygous basecalls/double peaks in the trace).
+
+## Workflow
+
+My general workflow for cleaning and analyzing sequencing reads goes something like this:
+
+A) IMPORT AND CLEAN SANGER READS
+    1. Import the trace data (.ab1) into R using `sangerseqR::read.abif()`.
+    2. Identify trim locations
+       (a) End-of-read trims (for locating 3' end of sequence)
+            i) align read with the reverse complement of the opposing primer (i.e., align forward read with reverse complement of reverse primer and align reverse read with reverse complement of forward primer)
+           ii) identify trim location as the last un-matched base in the read sequence prior to alignment with the primer
+       (b) Trim read to target sequence
+            i) align read with the upstream and [reverse complement of downstream] primers flanking the lineage-barcoding region
+            ii) identify trim locations as the first un-matched base after the upstream primer and the last un-matched base before the downstream primer
+            iii) in the event that the target region thus identified is shorter than expected (say, <450bp; expectation is 479), I assume that the read is incomplete and/or of low quality, and ignore this step
+       (c) Quality trims (for locating 5' and 3' ends of quality sequence)
+            i) use a modified Mott algorithm to identify locations where basecall quality drops below some critical value at the start and end of reads
+            ii) if necessary, fix Mott trim locations in accordance with base-dropping that may be performed by basecalling functions in `sangerseqR`. The `makeBaseCalls()` function occasionally trims a few bases from the start of the raw read; this step simply rectifies the Mott trims to match those positions.
+       (d) Reconcile end-of-read and Mott trims
+            i) for the 3' trim location, take whichever comes first---the 3' Mott trim location or the primer trim location (i.e., if quality drops off before end of read, terminate sequence early)
+    3. Identify secondary peaks (indicate co-infection with multiple parasite lineages)^[this is one step about which I feel especially uncertain, partly because there is considerable variation between reads in terms of quality, even after trimming]
+       (a) use `sangerseqR::makeBaseCalls()` to make primary and secondary basecalls from the ABIF object
+       (b) trim basecalled sequences according to locations identified in (2) above
+       (c) compare basecalled sequences; secondary peaks are indicated whenever the two sequences are not in agreement
+
+B) IDENTIFY PRIMARY CONSENSUS SEQUENCES
+    1. Extract primary basecalled sequences from each ABIF object
+    2. Trim sequences according to locations identified in (A.2) above.
+    3. Align forward and reverse basecalled sequences for each sample sequences
+       (a) match forward and reverse sequences based on sample ID
+       (b) get reverse complement of reverse sequences
+       (c) align forward and reverse sequences using `msa::msa(method="Muscle")` with default settings
+    4. Compute primary consensus sequence with `DECIPHER::ConsensusSequence()` and default settings (note that in a few cases, one of the reads was of such poor quality that the trimmed length was 0; when that happened, I took the remaining [trimmed] read as the consensus—so, some consensus sequences are defined by both forward and reverse reads, others by just one or the other)
+
+C) IDENTIFY SECONDARY CONSENSUS SEQUENCES
+    1. Subset data to include only reads for which secondary peaks were identified within the trimmed sequence
+    2. Repeat (B) above using secondary basecalled sequences
+
+D) PERFORM BLASTn SEARCH OF NCBI DATABASE
+    1. I performed searches for primary and secondary sequences separately
+    2. Write consensus sequences to a FASTA file, using `N` as an indication for no consensus (the default no-consensus character in DECIPHER is '+', but BLAST ignores this in base counts)
+    3. Copy and paste FASTA sequences into the BLASTn web interface; search using default (megablast) settings (I was originally trying to do this in R, but the BLAST+ interface was very slow, even for a small number of sequences)
+    4. Save BLASTn results as an xml tree for parsing in R
+
+E) PERFORM BLAST SEARCH OF MalAvi DATABASE
+    1. MalAvi is a database specifically for avian blood parasite sequences
+    2. Search is performed in R using `malaviR::blast_malavi()`
+    3. Output is roughly similar to BLASTn output, with fields for bitscore, percent identity, gaps, etc.
+
+F) COMPILE BLAST RESULTS
+    1. Merge NCBI and MalAvi search results, joining by sample ID
+    2. Write results to two separate files, one for primary consensus sequence hits and another for secondary consensus sequence hits
+    3. There is a many-to-one relation between GenBank accession numbers and parasite lineages—each lineage could correspond to many NCBI sequences (although there is usually one accession number corresponding to the initial reference source for the lineage).
+
+# WORKFLOW
+
+
